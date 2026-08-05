@@ -12,7 +12,7 @@ TIMEOUT_LIMIT_SEC = 2.0  # Safety heartbeat limit
 class VirtualRobot:
 
     def __init__(
-        self, robot_id=1, start_x=0.5, start_y=0.5, start_theta=0.0
+        self, robot_id=1, start_x=0.5, start_y=0.5, start_theta=90.0
     ):
         self.id = robot_id
         self.x = start_x  # meters
