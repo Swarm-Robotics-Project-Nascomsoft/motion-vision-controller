@@ -1,0 +1,31 @@
+What You Need FROM Hardware/Firmware (Your Inputs)
+
+Because you are using an overhead camera for your "eyes," you actually do not need the robot to tell you where it is. However, you absolutely need the Hardware team to give you the following static physical numbers to put into your code before you can do any path planning:
+
+    Track Width: The exact distance between the left and right wheels. You need this for the math that calculates how the robot turns.
+
+    Wheel Radius: The exact size of the wheels. You need this to convert your code's speed commands (e.g., "move 1 meter per second") into how fast the motor actually needs to spin.
+
+    Bounding Box: The exact length and width of the robot chassis. Your C++ path planner needs this to create a "safety bubble" around the robot so it doesn't scrape against walls or other robots.
+
+
+What You Must Send TO Firmware (Your Outputs)
+
+To make the robots move, pick up a package, and drop it off, your Python code must output specific commands over the Wi-Fi using UDP network packets. You will not send commands like "Go to coordinates X, Y." Instead, you will send low-level mechanical commands:
+
+    Velocity Commands (Movement): Because these are "differential drive" robots (like a tank), you control them by telling the wheels how fast to spin. Your code will calculate and output two numbers:
+
+        Target speed for the Left Wheel.
+
+        Target speed for the Right Wheel.
+
+        (If both are positive, it drives straight. If they spin in opposite directions, it spins in place).
+
+    Actuator Commands (Pick Up/Drop Off): To interact with packages, the hardware team will build a mechanism (like a servo motor that lowers a hook, or an electromagnet). Your code will output a simple state command for this mechanism. For example:
+
+        0 = Do nothing / Travel mode
+
+        1 = Engage (Pick up package)
+
+        2 = Disengage (Drop package)
+
