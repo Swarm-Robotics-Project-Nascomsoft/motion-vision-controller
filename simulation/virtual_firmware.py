@@ -1,101 +1,107 @@
+import cv2
+import numpy as np
+import cv2.aruco as aruco
 import math
-import socket
-import struct
-import time
+import socket # <-- Network library
 
-# --- Robot Physical Parameters ---
-WHEEL_BASE = 0.08  # Distance between wheels in meters (80mm)
-UPDATE_RATE_HZ = 50.0  # Simulation loop frequency (50 Hz -> dt = 0.02s)
-TIMEOUT_LIMIT_SEC = 2.0  # Safety heartbeat limit
-
-
-class VirtualRobot:
-
-    def __init__(
-        self, robot_id=1, start_x=0.5, start_y=0.5, start_theta=90.0
-    ):
-        self.id = robot_id
-        self.x = start_x  # meters
-        self.y = start_y  # meters
-        self.theta = start_theta  # radians
-
-        self.v_left = 0.0  # m/s
-        self.v_right = 0.0  # m/s
-        self.last_command_time = time.time()
-
-    def update_kinematics(self, dt: float):
-        """Updates robot position based on current wheel velocities."""
-        # 1. Heartbeat Fail-Safe Check
-        if time.time() - self.last_command_time > TIMEOUT_LIMIT_SEC:
-            self.v_left = 0.0
-            self.v_right = 0.0
-
-        # 2. Differential Drive Math
-        v = (self.v_right + self.v_left) / 2.0
-        omega = (self.v_right - self.v_left) / WHEEL_BASE
-
-        # 3. Euler Integration
-        self.x += v * math.cos(self.theta) * dt
-        self.y += v * math.sin(self.theta) * dt
-        self.theta += omega * dt
-
-        # Normalize angle to [-pi, pi]
-        self.theta = math.atan2(math.sin(self.theta), math.cos(self.theta))
-
+def get_marker_info(marker_id):
+    """Assigns a group color and custom label based on the marker ID."""
+    if 0 <= marker_id <= 2:
+        return (0, 255, 0), f"Robot {marker_id + 1}"
+    elif 3 <= marker_id <= 5:
+        return (255, 0, 0), f"Pallet {marker_id - 2}"
+    elif 6 <= marker_id <= 8:
+        return (0, 0, 255), f"Dest {marker_id - 5}"
+    else:
+        return (255, 255, 255), f"Unknown ({marker_id})"
 
 def main():
-    # Setup non-blocking UDP Socket listening on localhost
+    # Setup ArUco
+    aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+    parameters = aruco.DetectorParameters()
+    detector = aruco.ArucoDetector(aruco_dict, parameters)
+
+    # Setup Camera
+    cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+
+    # Setup Window
+    window_name = "Centralized Brain Vision"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    is_fullscreen = True
+
+    # --- SETUP UDP NETWORK ---
     UDP_IP = "127.0.0.1"
-    UDP_PORT = 5000
-    TELEMETRY_PORT = 5001
-
+    UDP_PORT = 5005
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((UDP_IP, UDP_PORT))
-    sock.setblocking(False)
+    print(f"Network Active: Broadcasting to {UDP_IP}:{UDP_PORT}")
+    # -------------------------
 
-    telemetry_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    telemetry_addr = (UDP_IP, TELEMETRY_PORT)
-
-    robot = VirtualRobot(robot_id=1)
-    dt = 1.0 / UPDATE_RATE_HZ
-
-    print(
-        f"[Virtual Firmware] Robot #{robot.id} running. Listening on UDP {UDP_IP}:{UDP_PORT}..."
-    )
+    print("Starting camera... Press 'q' to quit, 'f' to toggle fullscreen.")
 
     while True:
-        loop_start = time.time()
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to grab frame")
+            break
 
-        # Try reading incoming command packet (Expects 2 big-endian floats: v_left, v_right)
-        try:
-            data, _ = sock.recvfrom(1024)
-            if len(data) == 8:
-                v_l, v_r = struct.unpack("!ff", data)
-                robot.v_left = v_l
-                robot.v_right = v_r
-                robot.last_command_time = time.time()
-        except BlockingIOError:
-            pass  # No packet received this iteration
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        corners, ids, rejected = detector.detectMarkers(gray_frame)
 
-        # Step physics forward
-        robot.update_kinematics(dt)
+        if ids is not None:
+            flat_ids = ids.flatten()
+            
+            # 1. Create empty list for this specific frame
+            frame_data = [] 
+            
+            for i in range(len(flat_ids)):
+                marker_id = flat_ids[i]
+                marker_corners = corners[i][0]
+                color, label_text = get_marker_info(marker_id)
 
-        # Pack 3 floats (x, y, theta) into 12 bytes and send
-        telemetry_packet = struct.pack("!fff", robot.x, robot.y, robot.theta)
-        telemetry_sock.sendto(telemetry_packet, telemetry_addr)
+                pts = np.int32(marker_corners).reshape(-1, 1, 2)
+                cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=3)
 
-        # Print current pose to console (clears line with \r)
-        print(
-            f"\r[Pose] X: {robot.x:6.3f}m | Y: {robot.y:6.3f}m | θ: {math.degrees(robot.theta):6.1f}° | V_L: {robot.v_left:5.2f} | V_R: {robot.v_right:5.2f}",
-            end="",
-        )
+                center_x = int(np.mean(marker_corners[:, 0]))
+                center_y = int(np.mean(marker_corners[:, 1]))
 
-        # Enforce exact rate timing
-        elapsed = time.time() - loop_start
-        sleep_time = dt - elapsed
-        if sleep_time > 0:
-            time.sleep(sleep_time)
+                top_center_x = (marker_corners[0][0] + marker_corners[1][0]) / 2.0
+                top_center_y = (marker_corners[0][1] + marker_corners[1][1]) / 2.0
+                dx = top_center_x - center_x
+                dy = center_y - top_center_y 
+                theta_rad = math.atan2(dy, dx)
+                theta_deg = (math.degrees(theta_rad) + 360) % 360 
 
+                cv2.line(frame, (center_x, center_y), (int(top_center_x), int(top_center_y)), (0, 0, 255), 3)
+                cv2.putText(frame, label_text, (center_x - 30, center_y), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+
+                # Output to Python terminal
+                print(f"{label_text} -> X: {center_x}, Y: {center_y}, Heading: {int(theta_deg)}°")
+
+                # 2. Add this marker's raw math to the network list
+                frame_data.append(f"{marker_id},{center_x},{center_y},{int(theta_deg)}")
+
+            # 3. If we have data, broadcast it over UDP!
+            if len(frame_data) > 0:
+                packet = ";".join(frame_data)
+                sock.sendto(packet.encode('utf-8'), (UDP_IP, UDP_PORT))
+
+        cv2.imshow(window_name, frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('f'):
+            is_fullscreen = not is_fullscreen
+            if is_fullscreen:
+                cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+            else:
+                cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+
+    cap.release()
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()

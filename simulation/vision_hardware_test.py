@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import cv2.aruco as aruco
 import math
+import socket
 
 def get_marker_info(marker_id):
     """Assigns a group color and custom label based on the marker ID."""
@@ -54,6 +55,11 @@ def main():
     is_fullscreen = True
 
     print("Starting camera... Press 'q' to quit, 'f' to toggle fullscreen.")
+
+    # --- SETUP UDP NETWORK ---
+    UDP_IP = "127.0.0.1" # Localhost (your own computer)
+    UDP_PORT = 5005      # A random open port channel
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     while True:
         ret, frame = cap.read()
