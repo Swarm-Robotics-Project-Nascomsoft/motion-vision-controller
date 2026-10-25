@@ -56,6 +56,7 @@ namespace Config {
     static const int    VISION_RX_PORT   = 5005;          // Receive vision data
     static const int    COMMAND_TX_PORT  = 5000;          // Transmit wheel commands
     static const int    VIZ_TX_PORT      = 5006;          // Transmit visualizer AR paths
+    static const int    DASHBOARD_TX_PORT= 5007;          // Transmit status to dashboard
     static const char*  LOCALHOST        = "127.0.0.1";
 
     // ---- Arena & Metric Calibration ----
@@ -543,6 +544,7 @@ struct RobotCtrl {
     double                 lastWarnTime= 0.0;   // for rate-limiting no-path warning logs
     WheelVel               cmdVel;              // latest computed command
     int                    actuator    = 0;     // 0=travel, 1=pick, 2=drop
+    bool                   manualAssign= false; // true if assigned via dashboard ASSIGN cmd
 };
 
 
@@ -563,9 +565,15 @@ public:
     MetricCalibrator calibrator;
     OccupancyGrid    grid;
 
+    // Dashboard state
+    bool                      paused = false;          // PAUSE/RESUME toggle
+    std::array<bool, 9>       deactivated;             // per-entity deactivation override
+    bool                      statusRequested = false;  // set by STATUS cmd, cleared after send
+
     TaskManager() {
         palletAssigned.fill(false);
         palletDelivered.fill(false);
+        deactivated.fill(false);
     }
 
     // ------------------------------------------------------------------
@@ -601,6 +609,154 @@ public:
                     }
                 } catch (...) {}
             }
+            return;
+        }
+
+        // ---- Dashboard command: ASSIGN;<robot_index>;<pallet_id>;<dest_id> ----
+        if (packet.rfind("ASSIGN;", 0) == 0) {
+            std::istringstream ss(packet.substr(7));
+            std::string rStr, pStr, dStr;
+            if (std::getline(ss, rStr, ';') &&
+                std::getline(ss, pStr, ';') &&
+                std::getline(ss, dStr, ';'))
+            {
+                try {
+                    int ri = std::stoi(rStr);
+                    int pi = std::stoi(pStr);
+                    int di = std::stoi(dStr);
+                    if (ri >= 0 && ri < Config::MAX_ROBOTS &&
+                        pi >= 3 && pi <= 5 && di >= 6 && di <= 8)
+                    {
+                        // Unassign old pallet if any
+                        int oldSlot = robots[ri].targetPallet - 3;
+                        if (oldSlot >= 0 && oldSlot < 3) {
+                            palletAssigned[oldSlot] = false;
+                        }
+                        // Mark new pallet as assigned
+                        palletAssigned[pi - 3] = true;
+                        robots[ri].targetPallet  = pi;
+                        robots[ri].targetDest    = di;
+                        robots[ri].state         = RobotState::DRIVING_TO_PALLET;
+                        robots[ri].wpIdx         = 0;
+                        robots[ri].path.clear();
+                        robots[ri].manualAssign  = true;
+                        robots[ri].actuator      = 0;
+                        std::cout << "[DASHBOARD] ASSIGN Robot " << ri
+                                  << " -> Pallet " << pi << " -> Dest " << di << std::endl;
+                    }
+                } catch (...) {}
+            }
+            return;
+        }
+
+        // ---- Dashboard command: ESTOP ----
+        if (packet == "ESTOP") {
+            for (int r = 0; r < Config::MAX_ROBOTS; ++r) {
+                robots[r].cmdVel   = {0.0f, 0.0f};
+                robots[r].state    = RobotState::IDLE;
+                robots[r].path.clear();
+                robots[r].targetPallet = -1;
+                robots[r].targetDest   = -1;
+                robots[r].actuator     = 0;
+                robots[r].manualAssign = false;
+            }
+            palletAssigned.fill(false);
+            std::cout << "[ESTOP] Emergency stop activated!" << std::endl;
+            return;
+        }
+
+        // ---- Dashboard command: DEACTIVATE;<entity_id> ----
+        if (packet.rfind("DEACTIVATE;", 0) == 0) {
+            try {
+                int eid = std::stoi(packet.substr(11));
+                if (eid >= 0 && eid <= 8) {
+                    deactivated[eid] = true;
+                    entities[eid].active = false;
+                    // If it's a robot, also idle it
+                    if (eid >= 0 && eid <= 2) {
+                        robots[eid].state    = RobotState::IDLE;
+                        robots[eid].path.clear();
+                        robots[eid].cmdVel   = {0.0f, 0.0f};
+                        robots[eid].actuator = 0;
+                        robots[eid].manualAssign = false;
+                        // Unassign its pallet
+                        int ps = robots[eid].targetPallet - 3;
+                        if (ps >= 0 && ps < 3) palletAssigned[ps] = false;
+                        robots[eid].targetPallet = -1;
+                        robots[eid].targetDest   = -1;
+                    }
+                    // If it's a pallet assigned to a robot, unassign that robot
+                    if (eid >= 3 && eid <= 5) {
+                        int slot = eid - 3;
+                        if (palletAssigned[slot]) {
+                            palletAssigned[slot] = false;
+                            for (int r = 0; r < Config::MAX_ROBOTS; ++r) {
+                                if (robots[r].targetPallet == eid) {
+                                    robots[r].state        = RobotState::IDLE;
+                                    robots[r].path.clear();
+                                    robots[r].cmdVel       = {0.0f, 0.0f};
+                                    robots[r].targetPallet = -1;
+                                    robots[r].targetDest   = -1;
+                                    robots[r].actuator     = 0;
+                                    robots[r].manualAssign = false;
+                                }
+                            }
+                        }
+                    }
+                    std::cout << "[DASHBOARD] Deactivated entity " << eid << std::endl;
+                }
+            } catch (...) {}
+            return;
+        }
+
+        // ---- Dashboard command: ACTIVATE;<entity_id> ----
+        if (packet.rfind("ACTIVATE;", 0) == 0) {
+            try {
+                int eid = std::stoi(packet.substr(9));
+                if (eid >= 0 && eid <= 8) {
+                    deactivated[eid] = false;
+                    entities[eid].active = true;
+                    std::cout << "[DASHBOARD] Activated entity " << eid << std::endl;
+                }
+            } catch (...) {}
+            return;
+        }
+
+        // ---- Dashboard command: STATUS ----
+        if (packet == "STATUS") {
+            statusRequested = true;
+            return;
+        }
+
+        // ---- Dashboard command: PAUSE ----
+        if (packet == "PAUSE") {
+            paused = true;
+            std::cout << "[DASHBOARD] System PAUSED" << std::endl;
+            return;
+        }
+
+        // ---- Dashboard command: RESUME ----
+        if (packet == "RESUME") {
+            paused = false;
+            std::cout << "[DASHBOARD] System RESUMED" << std::endl;
+            return;
+        }
+
+        // ---- Dashboard command: RESET ----
+        if (packet == "RESET") {
+            for (int r = 0; r < Config::MAX_ROBOTS; ++r) {
+                robots[r].state        = RobotState::IDLE;
+                robots[r].targetPallet = -1;
+                robots[r].targetDest   = -1;
+                robots[r].path.clear();
+                robots[r].cmdVel       = {0.0f, 0.0f};
+                robots[r].actuator     = 0;
+                robots[r].manualAssign = false;
+            }
+            palletAssigned.fill(false);
+            palletDelivered.fill(false);
+            paused = false;
+            std::cout << "[DASHBOARD] System RESET" << std::endl;
             return;
         }
 
@@ -648,6 +804,11 @@ public:
             entities[rawId].rawPy    = py;
             entities[rawId].active   = true;
             entities[rawId].lastSeen = now;
+
+            // Override: if entity was deactivated via dashboard, force inactive
+            if (deactivated[rawId]) {
+                entities[rawId].active = false;
+            }
         }
     }
 
@@ -728,6 +889,7 @@ public:
     void assignTasks() {
         for (int r = 0; r < Config::MAX_ROBOTS; ++r) {
             if (robots[r].state != RobotState::IDLE) continue;
+            if (robots[r].manualAssign) continue;   // skip dashboard-assigned robots
             int robotId = r;  // ArUco IDs 0-2
 
             if (!entities[robotId].active) continue;
@@ -769,6 +931,16 @@ public:
     //  Step every robot's state machine for one control cycle
     // ------------------------------------------------------------------
     void update(double now) {
+        // If paused, zero all velocities and skip FSM stepping
+        if (paused) {
+            for (int r = 0; r < Config::MAX_ROBOTS; ++r) {
+                robots[r].cmdVel   = {0.0f, 0.0f};
+                robots[r].actuator = (robots[r].state == RobotState::PICKING_UP)  ? 1 :
+                                     (robots[r].state == RobotState::DROPPING_OFF) ? 2 : 0;
+            }
+            return;
+        }
+
         // 1. Try to assign any idle robots
         assignTasks();
 
@@ -919,6 +1091,78 @@ public:
         }
     }
 
+    // ------------------------------------------------------------------
+    //  Build a JSON status string for the dashboard STATUS query
+    // ------------------------------------------------------------------
+    std::string buildStatusJson(int cycleCount) {
+        std::ostringstream js;
+        js << std::fixed << std::setprecision(4);
+        js << "{\"cycle\":" << cycleCount
+           << ",\"ppm\":" << calibrator.ppm
+           << ",\"paused\":" << (paused ? "true" : "false");
+
+        // Robots
+        js << ",\"robots\":[";
+        for (int r = 0; r < Config::MAX_ROBOTS; ++r) {
+            if (r > 0) js << ",";
+            const auto& e = entities[r];
+            const auto& c = robots[r];
+            js << "{\"id\":" << r
+               << ",\"state\":\"" << robotStateName(c.state) << "\""
+               << ",\"active\":" << (e.active ? "true" : "false")
+               << ",\"x\":" << e.pose.x
+               << ",\"y\":" << e.pose.y
+               << ",\"heading\":" << std::setprecision(1) << radToDeg(e.pose.theta)
+               << std::setprecision(4)
+               << ",\"px\":" << e.rawPx
+               << ",\"py\":" << e.rawPy
+               << ",\"target_pallet\":" << c.targetPallet
+               << ",\"target_dest\":" << c.targetDest
+               << ",\"vL\":" << c.cmdVel.vLeft
+               << ",\"vR\":" << c.cmdVel.vRight
+               << ",\"actuator\":" << c.actuator
+               << ",\"manual\":" << (c.manualAssign ? "true" : "false")
+               << "}";
+        }
+        js << "]";
+
+        // Pallets
+        js << ",\"pallets\":[";
+        for (int p = 0; p < Config::MAX_PALLETS; ++p) {
+            if (p > 0) js << ",";
+            int pid = 3 + p;
+            const auto& e = entities[pid];
+            js << "{\"id\":" << pid
+               << ",\"active\":" << (e.active ? "true" : "false")
+               << ",\"x\":" << e.pose.x
+               << ",\"y\":" << e.pose.y
+               << ",\"px\":" << e.rawPx
+               << ",\"py\":" << e.rawPy
+               << ",\"assigned\":" << (palletAssigned[p] ? "true" : "false")
+               << ",\"delivered\":" << (palletDelivered[p] ? "true" : "false")
+               << "}";
+        }
+        js << "]";
+
+        // Destinations
+        js << ",\"destinations\":[";
+        for (int d = 0; d < Config::MAX_DESTINATIONS; ++d) {
+            if (d > 0) js << ",";
+            int did = 6 + d;
+            const auto& e = entities[did];
+            js << "{\"id\":" << did
+               << ",\"active\":" << (e.active ? "true" : "false")
+               << ",\"x\":" << e.pose.x
+               << ",\"y\":" << e.pose.y
+               << ",\"px\":" << e.rawPx
+               << ",\"py\":" << e.rawPy
+               << "}";
+        }
+        js << "]}";
+
+        return js.str();
+    }
+
 private:
     /// Advance a robot along its pre-computed path using the pursuit controller.
     void followPath(int r, const Pose& rpose) {
@@ -961,10 +1205,12 @@ private:
 
 class NetworkManager {
 public:
-    SOCKET rxSock = INVALID_SOCKET;
-    SOCKET txSock = INVALID_SOCKET;
+    SOCKET rxSock     = INVALID_SOCKET;
+    SOCKET txSock     = INVALID_SOCKET;
+    SOCKET statusSock = INVALID_SOCKET;    // for sending STATUS to dashboard
     sockaddr_in txAddr;
     sockaddr_in vizAddr;
+    sockaddr_in dashAddr;                  // dashboard target 127.0.0.1:5007
 
     bool init() {
         // ---- Initialise Winsock ----
@@ -1013,11 +1259,25 @@ public:
         vizAddr.sin_port        = htons(Config::VIZ_TX_PORT);
         vizAddr.sin_addr.s_addr = inet_addr(Config::LOCALHOST);
 
+        // ---- Status socket (dashboard status out) ----
+        statusSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (statusSock == INVALID_SOCKET) {
+            std::cerr << "[NET] Status socket creation failed!" << std::endl;
+            return false;
+        }
+
+        memset(&dashAddr, 0, sizeof(dashAddr));
+        dashAddr.sin_family      = AF_INET;
+        dashAddr.sin_port        = htons(Config::DASHBOARD_TX_PORT);
+        dashAddr.sin_addr.s_addr = inet_addr(Config::LOCALHOST);
+
         std::cout << "[NET] RX listening on UDP :" << Config::VISION_RX_PORT << std::endl;
         std::cout << "[NET] TX targeting  UDP " << Config::LOCALHOST
                   << ":" << Config::COMMAND_TX_PORT << std::endl;
         std::cout << "[NET] VIZ targeting UDP " << Config::LOCALHOST
                   << ":" << Config::VIZ_TX_PORT << std::endl;
+        std::cout << "[NET] DASH targeting UDP " << Config::LOCALHOST
+                  << ":" << Config::DASHBOARD_TX_PORT << std::endl;
         return true;
     }
 
@@ -1065,9 +1325,16 @@ public:
                (SOCKADDR*)&vizAddr, sizeof(vizAddr));
     }
 
+    /// Send a JSON status string to the dashboard on the status port.
+    void sendStatus(const std::string& json) {
+        sendto(statusSock, json.c_str(), (int)json.size(), 0,
+               (SOCKADDR*)&dashAddr, sizeof(dashAddr));
+    }
+
     void shutdown() {
-        if (rxSock != INVALID_SOCKET) closesocket(rxSock);
-        if (txSock != INVALID_SOCKET) closesocket(txSock);
+        if (rxSock     != INVALID_SOCKET) closesocket(rxSock);
+        if (txSock     != INVALID_SOCKET) closesocket(txSock);
+        if (statusSock != INVALID_SOCKET) closesocket(statusSock);
         WSACleanup();
     }
 };
@@ -1136,6 +1403,13 @@ int main() {
 
         // -------- PLAN & ACT --------
         mgr.update(now);
+
+        // -------- DASHBOARD STATUS RESPONSE --------
+        if (mgr.statusRequested) {
+            std::string json = mgr.buildStatusJson(cycleCount);
+            net.sendStatus(json);
+            mgr.statusRequested = false;
+        }
 
         // -------- TRANSMIT --------
         for (int r = 0; r < Config::MAX_ROBOTS; ++r) {

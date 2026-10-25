@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CAM-RS — Warehouse Operations OS</title>
+    <script>
+        (function () {
+            try {
+                var savedTheme = localStorage.getItem('aeline_theme');
+                var prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+                var theme = savedTheme ? savedTheme : (prefersDark ? 'dark' : 'light');
+                document.documentElement.setAttribute('data-theme', theme);
+            } catch (e) { }
+        })();
+    </script>
+    <link rel="stylesheet" href="/static/css/dashboard.css">
+</head>
+
+<body>
+    <!-- ============ TOP NAVIGATION BAR ============ -->
+    <nav class="top-bar">
+        <div class="top-bar-left">
+            <div class="brand-badge">
+                <div class="brand-logo-chip">
+                    <svg class="icon icon-lg" viewBox="0 0 24 24">
+                        <path
+                            d="M22 8.35V20a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8.35A2 2 0 0 1 3.26 6.5l8-3.2a2 2 0 0 1 1.48 0l8 3.2A2 2 0 0 1 22 8.35Z" />
+                        <path d="M6 18h12" />
+                        <path d="M6 14h12" />
+                    </svg>
+                </div>
+                <div class="brand-titles">
+                    <span class="brand-title">CAM-RS</span>
+                    <span class="brand-subtitle">Centralized Autonomous Multi-Robot System</span>
+                </div>
+            </div>
+        </div>
+        <div class="top-bar-right">
+            <div class="status-pill" id="camera-status">
+                <span class="dot"></span>
+                <span>Camera</span>
+            </div>
+            <div class="status-pill" id="planner-status">
+                <span class="dot"></span>
+                <span>Planner</span>
+            </div>
+            <div class="status-pill" id="ppm-display">
+                <span class="stat-pill-label">Scale</span>
+                <span class="stat-pill-value" id="ppm-value">--</span>
+                <span class="stat-pill-label">px/m</span>
+            </div>
+            <div class="status-pill" id="cycle-display">
+                <span class="stat-pill-label">Cycle</span>
+                <span class="stat-pill-value" id="cycle-value">--</span>
+            </div>
+            <!-- Theme Mode Segmented Toggle Pill (100% Vector SVG, Zero Emojis) -->
+            <div class="theme-toggle-pill" id="theme-toggle" role="radiogroup" aria-label="Color Theme Selection">
+                <div class="theme-pill-track">
+                    <button type="button" class="theme-pill-option theme-opt-light" onclick="setTheme('light')"
+                        title="Switch to Light Theme" aria-label="Light Theme">
+                        <svg class="icon icon-xs" viewBox="0 0 24 24">
+                            <circle cx="12" cy="12" r="5" />
+                            <line x1="12" y1="1" x2="12" y2="3" />
+                            <line x1="12" y1="21" x2="12" y2="23" />
+                            <line x1="4.22" y1="4.22" x2="5.64" y2="5.64" />
+                            <line x1="18.36" y1="18.36" x2="19.78" y2="19.78" />
+                            <line x1="1" y1="12" x2="3" y2="12" />
+                            <line x1="21" y1="12" x2="23" y2="12" />
+                            <line x1="4.22" y1="19.78" x2="5.64" y2="18.36" />
+                            <line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
+                        </svg>
+                        <span>Light</span>
+                    </button>
+                    <button type="button" class="theme-pill-option theme-opt-dark" onclick="setTheme('dark')"
+                        title="Switch to Dark Theme" aria-label="Dark Theme">
+                        <svg class="icon icon-xs" viewBox="0 0 24 24">
+                            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+                        </svg>
+                        <span>Dark</span>
+                    </button>
+                    <span class="theme-pill-slider"></span>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- ============ MAIN BENTO LAYOUT ============ -->
+    <div class="main-layout">
+
+        <!-- ---- LEFT PANEL: OPTICAL SENSING & INSPECTOR ---- -->
+        <div class="panel">
+            <!-- Camera Viewport Card -->
+            <div class="bento-card camera-card">
+                <div class="camera-header">
+                    <div class="camera-header-left">
+                        <span class="camera-tag">Optical Viewfinder</span>
+                    </div>
+                    <div class="camera-live-chip">
+                        <span class="camera-live-dot"></span>
+                        <span>LIVE VISION</span>
+                    </div>
+                </div>
+                <div class="camera-container">
+                    <img id="camera-feed" src="/video_feed" alt="Overhead Camera Stream">
+                    <div id="entity-tooltip" class="entity-tooltip hidden"></div>
+                </div>
+            </div>
+
+            <!-- Entity Inspector Bento Card -->
+            <div class="bento-card inspector-card" id="inspector-card">
+                <div class="bento-header">
+                    <div class="bento-title-group">
+                        <div class="icon-chip chip-subtle">
+                            <svg class="icon" viewBox="0 0 24 24">
+                                <circle cx="11" cy="11" r="8" />
+                                <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                            </svg>
+                        </div>
+                        <span class="bento-title">Component Inspector</span>
+                    </div>
+                    <span class="bento-tag">Real-Time Telemetry</span>
+                </div>
+                <div id="entity-inspector">
+                    <p class="inspector-hint">Hover or click any robot, pallet, or destination card to inspect its
+                        telemetry</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- ---- CENTER PANEL: FLEET COMMAND & MISSION CONTROL ---- -->
+        <div class="panel">
+
+            <!-- E-STOP High-Impact Pill -->
+            <button id="btn-estop" class="estop-pill-btn" onclick="sendEstop()">
+                <svg class="icon icon-estop" viewBox="0 0 24 24">
+                    <polygon points="7.86 2 16.14 2 22 7.86 22 16.14 16.14 22 7.86 22 2 16.14 2 7.86 7.86 2" />
+                    <line x1="12" y1="8" x2="12" y2="12" />
+                    <line x1="12" y1="16" x2="12.01" y2="16" />
+                </svg>
+                EMERGENCY STOP
+            </button>
+
+            <!-- Mode Command Pill Bar -->
+            <div class="command-pill-bar">
+                <button class="pill-action-btn" onclick="sendPause()" id="btn-pause">
+                    <svg class="icon icon-sm" viewBox="0 0 24 24">
+                        <rect x="6" y="4" width="4" height="16" />
+                        <rect x="14" y="4" width="4" height="16" />
+                    </svg>
+                    Pause Fleet
+                </button>
+                <button class="pill-action-btn" onclick="sendResume()" id="btn-resume">
+                    <svg class="icon icon-sm" viewBox="0 0 24 24">
+                        <polygon points="5 3 19 12 5 21 5 3" />
+                    </svg>
+                    Resume
+                </button>
+                <button class="pill-action-btn" onclick="sendReset()">
+                    <svg class="icon icon-sm" viewBox="0 0 24 24">
+                        <polyline points="23 4 23 10 17 10" />
+                        <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+                    </svg>
+                    Reset System
+                </button>
+                <button class="pill-action-btn btn-cta-lime" onclick="sendLifted('ALL')">
+                    <svg class="icon icon-sm" viewBox="0 0 24 24">
+                        <path d="M12 3v12" />
+                        <path d="m8 7 4-4 4 4" />
+                        <rect x="4" y="15" width="16" height="6" rx="2" />
+                    </svg>
+                    Confirm Lift All
+                </button>
+            </div>
+
+            <!-- Active Robot Fleet -->
+            <div class="section-heading-group">
+                <span class="section-heading">
+                    <svg class="icon" viewBox="0 0 24 24">
+                        <rect x="3" y="11" width="18" height="10" rx="2" />
+                        <circle cx="12" cy="5" r="2" />
+                        <path d="M12 7v4" />
+                        <line x1="8" y1="16" x2="8" y2="16" />
+                        <line x1="16" y1="16" x2="16" y2="16" />
+                    </svg>
+                    Active Robot Fleet
+                </span>
+                <span class="section-counter">3 Units</span>
+            </div>
+            <div class="cards-grid" id="robot-cards">
+                <!-- Dynamically populated -->
+            </div>
+
+            <!-- Pallets Stations -->
+            <div class="section-heading-group">
+                <span class="section-heading">
+                    <svg class="icon" viewBox="0 0 24 24">
+                        <path
+                            d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+                        <polyline points="3.27 6.96 12 12.01 20.73 6.96" />
+                        <line x1="12" y1="22.08" x2="12" y2="12" />
+                    </svg>
+                    Warehouse Pallets
+                </span>
+                <span class="section-counter">3 Units</span>
+            </div>
+            <div class="cards-grid" id="pallet-cards">
+                <!-- Dynamically populated -->
+            </div>
+
+            <!-- Destinations -->
+            <div class="section-heading-group">
+                <span class="section-heading">
+                    <svg class="icon" viewBox="0 0 24 24">
+                        <circle cx="12" cy="12" r="10" />
+                        <circle cx="12" cy="12" r="6" />
+                        <circle cx="12" cy="12" r="2" />
+                    </svg>
+                    Target Destinations
+                </span>
+                <span class="section-counter">3 Zones</span>
+            </div>
+            <div class="cards-grid" id="dest-cards">
+                <!-- Dynamically populated -->
+            </div>
+
+            <!-- Manual Mission Configurator -->
+            <div class="bento-card configurator-card">
+                <div class="bento-header">
+                    <div class="bento-title-group">
+                        <div class="icon-chip chip-lime">
+                            <svg class="icon" viewBox="0 0 24 24">
+                                <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+                                <rect x="8" y="2" width="8" height="4" rx="1" />
+                                <path d="M9 14h6" />
+                                <path d="M9 18h6" />
+                                <path d="M9 10h1" />
+                            </svg>
+                        </div>
+                        <span class="bento-title">Mission Dispatcher</span>
+                    </div>
+                    <span class="bento-tag">Manual Override</span>
+                </div>
+                <div class="configurator-grid">
+                    <div class="config-field">
+                        <label class="config-label">Assign Robot</label>
+                        <select class="config-select" id="assign-robot">
+                            <option value="0">Robot 1 (Marker 0)</option>
+                            <option value="1">Robot 2 (Marker 1)</option>
+                            <option value="2">Robot 3 (Marker 2)</option>
+                        </select>
+                    </div>
+                    <div class="config-field">
+                        <label class="config-label">Target Pallet</label>
+                        <select class="config-select" id="assign-pallet">
+                            <option value="3">Pallet 1 (Marker 3)</option>
+                            <option value="4">Pallet 2 (Marker 4)</option>
+                            <option value="5">Pallet 3 (Marker 5)</option>
+                        </select>
+                    </div>
+                    <div class="config-field">
+                        <label class="config-label">Target Destination</label>
+                        <select class="config-select" id="assign-dest">
+                            <option value="6">Destination 1 (Marker 6)</option>
+                            <option value="7">Destination 2 (Marker 7)</option>
+                            <option value="8">Destination 3 (Marker 8)</option>
+                        </select>
+                    </div>
+                </div>
+                <button class="btn-dispatch" onclick="sendAssign()">
+                    <svg class="icon icon-sm" viewBox="0 0 24 24">
+                        <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+                        <polyline points="22 4 12 14.01 9 11.01" />
+                    </svg>
+                    Dispatch Mission Assignment
+                </button>
+            </div>
+
+        </div>
+
+        <!-- ---- RIGHT PANEL: OPERATIONAL ACTIVITY LOG ---- -->
+        <div class="panel">
+            <div class="bento-card log-panel-card">
+                <div class="bento-header">
+                    <div class="bento-title-group">
+                        <div class="icon-chip chip-dark">
+                            <svg class="icon" viewBox="0 0 24 24">
+                                <polyline points="4 17 10 11 4 5" />
+                                <line x1="12" y1="19" x2="20" y2="19" />
+                            </svg>
+                        </div>
+                        <span class="bento-title">Operational Feed</span>
+                    </div>
+                    <button class="clear-btn" onclick="clearLog()">Clear Feed</button>
+                </div>
+                <div class="log-list" id="activity-log">
+                    <!-- Event logs rendered here -->
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <script src="/static/js/dashboard.js"></script>
+</body>
+
+</html>
