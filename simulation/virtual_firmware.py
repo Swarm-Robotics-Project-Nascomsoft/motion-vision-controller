@@ -34,11 +34,12 @@ def draw_dashed_line(img, pt1, pt2, color, thickness=3, dash_len=14, gap_len=8):
         cv2.line(img, (sx, sy), (ex, ey), color, thickness, cv2.LINE_AA)
         curr += dash_len + gap_len
 
-def draw_ar_paths(frame, paths_dict, show_paths=True):
+def draw_ar_paths(frame, paths_dict, live_markers, show_paths=True):
     """
-    Renders semi-transparent AR trajectory paths from the C++ Planner:
+    Renders rock-solid semi-transparent AR trajectory paths from the C++ Planner:
       - Yellow dashed line when approaching pallet (DRIVE->PALLET)
       - Green dashed line when delivering to destination (DRIVE->DEST)
+    Endpoints are directly pinned to detected live marker centers so paths NEVER drift.
     """
     if not show_paths or not paths_dict:
         return frame
@@ -54,22 +55,41 @@ def draw_ar_paths(frame, paths_dict, show_paths=True):
             continue
 
         state = pdata.get('state', '')
-        pts = pdata.get('points', [])
-        if len(pts) < 2:
+        target_id = pdata.get('target_id', -1)
+        raw_pts = pdata.get('points', [])
+        if len(raw_pts) < 2:
             continue
 
-        # Color mapping based on state:
-        # Yellow for approach to pallet (BGR: 0, 230, 255)
-        # Emerald Green for delivery to destination (BGR: 50, 255, 50)
+        # Pin start point to the live robot center if detected
+        pts = list(raw_pts)
+        if rid in live_markers:
+            pts[0] = live_markers[rid]
+
+        # Pin end point to live target center if detected
+        if target_id in live_markers:
+            pts[-1] = live_markers[target_id]
+        elif "PALLET" in state or "PICK" in state:
+            # Fallback: check pallets 3, 4, 5
+            for pid in [3, 4, 5]:
+                if pid in live_markers and math.hypot(live_markers[pid][0] - pts[-1][0], live_markers[pid][1] - pts[-1][1]) < 150:
+                    pts[-1] = live_markers[pid]
+                    break
+        elif "DEST" in state:
+            # Fallback: check destinations 6, 7, 8
+            for did in [6, 7, 8]:
+                if did in live_markers and math.hypot(live_markers[did][0] - pts[-1][0], live_markers[did][1] - pts[-1][1]) < 150:
+                    pts[-1] = live_markers[did]
+                    break
+
         if "PALLET" in state:
             color = (0, 230, 255)          # Bright Yellow
-            badge_text = f"R{rid + 1} -> Pallet"
+            badge_text = f"R{rid + 1} -> Pallet {target_id - 2 if target_id >= 3 else ''}"
+        elif "PICK" in state:
+            color = (0, 230, 255)          # Bright Yellow
+            badge_text = f"R{rid + 1} [AT PALLET - Press 'L' when lifted]"
         elif "DEST" in state:
             color = (50, 255, 50)          # Emerald Green
-            badge_text = f"R{rid + 1} -> Dest"
-        elif "PICK" in state:
-            color = (255, 200, 0)          # Cyan
-            badge_text = f"R{rid + 1} [PICKING]"
+            badge_text = f"R{rid + 1} -> Dest {target_id - 5 if target_id >= 6 else ''}"
         elif "DROP" in state:
             color = (200, 50, 255)         # Magenta
             badge_text = f"R{rid + 1} [DROPPING]"
@@ -79,16 +99,16 @@ def draw_ar_paths(frame, paths_dict, show_paths=True):
 
         has_drawn = True
 
-        # 1. Draw dashed line connecting waypoints: Robot -> WP1 -> WP2 ... -> Target
+        # 1. Draw dashed line connecting waypoints: Robot -> WP1 -> ... -> Target
         for i in range(len(pts) - 1):
             draw_dashed_line(overlay, pts[i], pts[i + 1], color, thickness=3, dash_len=14, gap_len=8)
 
         # 2. Draw waypoint circles
         for i, pt in enumerate(pts):
             if i == 0:
-                continue  # Start point is the robot center
+                continue  # Start point is robot center
             elif i == len(pts) - 1:
-                # Final destination target halo
+                # Target halo
                 cv2.circle(overlay, pt, 9, color, -1, cv2.LINE_AA)
                 cv2.circle(overlay, pt, 14, (255, 255, 255), 2, cv2.LINE_AA)
             else:
@@ -102,7 +122,7 @@ def draw_ar_paths(frame, paths_dict, show_paths=True):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
 
     if has_drawn:
-        # Alpha-blend overlay (60% path + 40% camera frame) for semi-transparent holographic effect
+        # Alpha-blend overlay (60% path + 40% camera frame)
         cv2.addWeighted(overlay, 0.60, frame, 0.40, 0, frame)
 
     return frame
@@ -125,12 +145,10 @@ def main():
     show_paths = True
 
     # --- SETUP UDP NETWORKS ---
-    # TX: Broadcast camera vision telemetry to C++ Planner
     UDP_TX_IP = "127.0.0.1"
     UDP_TX_PORT = 5005
     tx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-    # RX: Receive planned AR paths from C++ Planner
     UDP_RX_PORT = 5006
     rx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     rx_sock.bind(("0.0.0.0", UDP_RX_PORT))
@@ -145,7 +163,17 @@ def main():
     print("    'q' : Quit")
     print("    'f' : Toggle Fullscreen")
     print("    'p' : Toggle AR Path Lines (ON/OFF)")
+    print("    'l' : Signal Pallet LIFTED (Shows Destination Path!)")
+    print("    '1', '2', '3' : Signal LIFTED for Robot 1, 2, or 3")
+    print("    'c' : Recalibrate 2cm Marker Scale")
     print("==================================================")
+
+    # --- PHYSICAL CONSTANTS & CALIBRATION ---
+    MARKER_PHYSICAL_SIZE_M = 0.02  # 2cm x 2cm physical printed marker
+    calibration_samples = []
+    CALIBRATION_FRAMES_NEEDED = 25
+    smoothed_ppm = 1200.0
+    ppm_calibrated = False
 
     active_paths = {}
 
@@ -167,14 +195,24 @@ def main():
                 elif parts[0] == "PATH" and len(parts) >= 4:
                     rid = int(parts[1])
                     state_str = parts[2]
+                    target_id = -1
+                    coord_idx = 3
+                    if ',' not in parts[3]:
+                        try:
+                            target_id = int(parts[3])
+                            coord_idx = 4
+                        except ValueError:
+                            target_id = -1
+
                     pts = []
-                    for coord_str in parts[3:]:
+                    for coord_str in parts[coord_idx:]:
                         if ',' in coord_str:
                             x_s, y_s = coord_str.split(',')
                             pts.append((int(x_s), int(y_s)))
                     if pts:
                         active_paths[rid] = {
                             'state': state_str,
+                            'target_id': target_id,
                             'points': pts,
                             'timestamp': time.time()
                         }
@@ -187,9 +225,12 @@ def main():
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corners, ids, rejected = detector.detectMarkers(gray_frame)
 
+        live_markers = {}
+
         if ids is not None:
             flat_ids = ids.flatten()
             frame_data = []
+            measured_ppms = []
 
             for i in range(len(flat_ids)):
                 marker_id = flat_ids[i]
@@ -201,6 +242,7 @@ def main():
 
                 center_x = int(np.mean(marker_corners[:, 0]))
                 center_y = int(np.mean(marker_corners[:, 1]))
+                live_markers[marker_id] = (center_x, center_y)
 
                 top_center_x = (marker_corners[0][0] + marker_corners[1][0]) / 2.0
                 top_center_y = (marker_corners[0][1] + marker_corners[1][1]) / 2.0
@@ -213,21 +255,46 @@ def main():
                 cv2.putText(frame, label_text, (center_x - 30, center_y),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
 
+                # Measure 2cm marker pixel width
+                if not ppm_calibrated:
+                    side_t = math.hypot(marker_corners[1][0] - marker_corners[0][0], marker_corners[1][1] - marker_corners[0][1])
+                    side_r = math.hypot(marker_corners[2][0] - marker_corners[1][0], marker_corners[2][1] - marker_corners[1][1])
+                    side_b = math.hypot(marker_corners[3][0] - marker_corners[2][0], marker_corners[3][1] - marker_corners[2][1])
+                    side_l = math.hypot(marker_corners[0][0] - marker_corners[3][0], marker_corners[0][1] - marker_corners[3][1])
+                    marker_px = (side_t + side_r + side_b + side_l) / 4.0
+                    if marker_px > 5.0:
+                        measured_ppms.append(marker_px / MARKER_PHYSICAL_SIZE_M)
+
                 frame_data.append(f"{marker_id},{center_x},{center_y},{int(theta_deg)}")
+
+            # Lock PPM calibration after sampling to prevent continuous coordinate vibration
+            if not ppm_calibrated and measured_ppms:
+                calibration_samples.append(float(np.median(measured_ppms)))
+                if len(calibration_samples) >= CALIBRATION_FRAMES_NEEDED:
+                    smoothed_ppm = float(round(np.median(calibration_samples)))
+                    ppm_calibrated = True
+                    print(f"[CALIBRATION LOCKED] Rock-solid scale locked: {int(smoothed_ppm)} px/m (2cm marker = {smoothed_ppm*MARKER_PHYSICAL_SIZE_M:.1f} px)")
+                    # Send locked PPM to C++ Planner
+                    tx_sock.sendto(f"PPM:{int(smoothed_ppm)}".encode('utf-8'), (UDP_TX_IP, UDP_TX_PORT))
 
             # Broadcast vision telemetry to C++ Planner
             if len(frame_data) > 0:
-                packet = ";".join(frame_data)
+                packet = f"PPM:{int(smoothed_ppm)};" + ";".join(frame_data)
                 tx_sock.sendto(packet.encode('utf-8'), (UDP_TX_IP, UDP_TX_PORT))
 
         # 3. Render AR planned trajectories over the frame
-        frame = draw_ar_paths(frame, active_paths, show_paths=show_paths)
+        frame = draw_ar_paths(frame, active_paths, live_markers, show_paths=show_paths)
 
         # 4. HUD Banner
         hud_status = "ON" if show_paths else "OFF"
         hud_color = (0, 255, 0) if show_paths else (0, 0, 255)
-        cv2.putText(frame, f"AR Paths: [{hud_status}] (P to toggle)", (25, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, hud_color, 2, cv2.LINE_AA)
+        cv2.putText(frame, f"AR Paths: [{hud_status}] (P: toggle | L: Lifted | C: Calibrate)", (25, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.60, hud_color, 2, cv2.LINE_AA)
+
+        calib_str = "LOCKED" if ppm_calibrated else f"Calibrating ({len(calibration_samples)}/{CALIBRATION_FRAMES_NEEDED})"
+        marker_px_disp = smoothed_ppm * MARKER_PHYSICAL_SIZE_M
+        cv2.putText(frame, f"Scale: {int(smoothed_ppm)} px/m [{calib_str}] (2cm = {marker_px_disp:.1f}px)",
+                    (25, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
 
         cv2.imshow(window_name, frame)
 
@@ -242,6 +309,18 @@ def main():
                 cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
         elif key == ord('p'):
             show_paths = not show_paths
+        elif key in [ord('l'), ord('L')]:
+            # Broadcast LIFTED signal for all active robots
+            tx_sock.sendto(b"LIFTED;ALL", (UDP_TX_IP, UDP_TX_PORT))
+            print("[LIFT SIGNAL] Broadcasted 'LIFTED;ALL' to Planner! (Destination paths will now show)")
+        elif key in [ord('1'), ord('2'), ord('3')]:
+            rid = key - ord('1')
+            tx_sock.sendto(f"LIFTED;{rid}".encode('utf-8'), (UDP_TX_IP, UDP_TX_PORT))
+            print(f"[LIFT SIGNAL] Broadcasted 'LIFTED;{rid}' for Robot {rid+1} to Planner!")
+        elif key in [ord('c'), ord('C')]:
+            calibration_samples = []
+            ppm_calibrated = False
+            print("[CALIBRATION] Reset! Collecting fresh samples from 2cm markers...")
 
     cap.release()
     cv2.destroyAllWindows()

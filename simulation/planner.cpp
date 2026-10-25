@@ -67,25 +67,27 @@ namespace Config {
     //           -> PIXELS_PER_METER = 400.0
     static const float  PIXELS_PER_METER = 400.0f;
 
-    //  Physical arena dimensions (metres).  Used for the occupancy grid bounds
-    //  and for flipping the Y-axis so the maths uses a standard right-hand
-    //  coordinate frame (Y increases upward).
-    static const float  ARENA_WIDTH_M    = 2.0f;
-    static const float  ARENA_HEIGHT_M   = 2.0f;
+    //  Physical arena dimensions (metres).  These MUST cover the full camera
+    //  field of view.  At 400 px/m, a 1920x1080 camera sees 4.8 x 2.7 m.
+    //  Setting 6x4 m (= 2400x1600 px) covers all common resolutions with margin.
+    static const float  ARENA_WIDTH_M    = 6.0f;
+    static const float  ARENA_HEIGHT_M   = 4.0f;
 
     // ---- Occupancy Grid ----
     //  Cell size controls path resolution.  Smaller cells = smoother paths but
-    //  more memory and slower A*.  5 cm is a good balance for a 2 m arena.
+    //  more memory and slower A*.  5 cm is a good balance.
+    //  At 6x4 m this yields 120x80 = 9600 cells — still very fast for A*.
     static const float  CELL_SIZE_M      = 0.05f;
-    static const int    GRID_COLS        = (int)(ARENA_WIDTH_M  / CELL_SIZE_M); // 40
-    static const int    GRID_ROWS        = (int)(ARENA_HEIGHT_M / CELL_SIZE_M); // 40
+    static const int    GRID_COLS        = (int)(ARENA_WIDTH_M  / CELL_SIZE_M); // 120
+    static const int    GRID_ROWS        = (int)(ARENA_HEIGHT_M / CELL_SIZE_M); // 80
 
-    // ---- Robot Physical Parameters (PLACEHOLDERS — get from hardware team) ----
-    static const float  TRACK_WIDTH_M    = 0.15f;   // Distance between left and right wheels
-    static const float  WHEEL_RADIUS_M   = 0.033f;  // Wheel radius
-    static const float  ROBOT_RADIUS_M   = 0.07f;   // Effective physical radius (~7 cm)
-    static const float  SAFETY_MARGIN_M  = 0.03f;   // Extra clearance (~3 cm)
-    static const int    MAX_INFLATION_CELLS = 2;    // Cap inflation cells for tabletop/camera testing
+    // ---- Robot Physical Parameters (from Hardware Team) ----
+    static const float  TRACK_WIDTH_M    = 0.08f;   // 8 cm wheel-to-wheel track width
+    static const float  WHEEL_RADIUS_M   = 0.03f;   // 3 cm wheel radius (6 cm diameter)
+    static const float  ROBOT_LENGTH_M   = 0.15f;   // 15 cm chassis length
+    static const float  ROBOT_WIDTH_M    = 0.13f;   // 13 cm chassis width
+    static const float  SAFETY_MARGIN_M  = 0.02f;   // 2 cm extra clearance margin
+    static const int    MAX_INFLATION_CELLS = 3;    // Cap inflation cells
 
     // ---- Motion Controller Gains ----
     static const float  MAX_LINEAR_VEL   = 0.30f;   // m/s   — top forward speed
@@ -159,6 +161,8 @@ struct Entity {
     int         rawId    = -1;           // ArUco marker ID (0-8)
     EntityType  type     = EntityType::UNKNOWN;
     Pose        pose;
+    int         rawPx    = 0;            // Original pixel X from camera
+    int         rawPy    = 0;            // Original pixel Y from camera
     bool        active   = false;        // Currently visible this frame
     double      lastSeen = 0.0;          // Timestamp of last observation (seconds)
 };
@@ -298,9 +302,11 @@ public:
         }
     }
 
-    /// Convenience: compute the inflation radius (in cells) from robot dimensions.
+    /// Convenience: compute the inflation radius (in cells) from real chassis dimensions.
     static int robotInflationCells() {
-        float totalRadius = Config::ROBOT_RADIUS_M + Config::SAFETY_MARGIN_M;
+        float halfDiag = std::sqrt(Config::ROBOT_LENGTH_M * Config::ROBOT_LENGTH_M +
+                                   Config::ROBOT_WIDTH_M  * Config::ROBOT_WIDTH_M) / 2.0f;
+        float totalRadius = halfDiag + Config::SAFETY_MARGIN_M;
         int cells = (int)std::ceil(totalRadius / Config::CELL_SIZE_M);
         return std::max(1, std::min(cells, Config::MAX_INFLATION_CELLS));
     }
@@ -563,18 +569,61 @@ public:
     }
 
     // ------------------------------------------------------------------
+    //  Signal from robot hardware or visualizer that pallet has been lifted
+    // ------------------------------------------------------------------
+    void signalPalletLifted(int r) {
+        if (r < 0 || r >= Config::MAX_ROBOTS) return;
+        if (robots[r].state == RobotState::PICKING_UP || robots[r].state == RobotState::DRIVING_TO_PALLET) {
+            robots[r].state = RobotState::CARRYING_TO_DEST;
+            robots[r].path.clear();
+            std::cout << "[SIGNAL] Robot " << (r + 1)
+                      << " pallet LIFTED confirmed! Now showing path to Destination "
+                      << (robots[r].targetDest - 5) << std::endl;
+        }
+    }
+
+    // ------------------------------------------------------------------
     //  Parse a vision UDP packet and update the world model
     // ------------------------------------------------------------------
     void ingestVisionPacket(const std::string& packet, double now) {
+        // Handle explicit LIFTED signal: "LIFTED;0" or "LIFTED;ALL"
+        if (packet.rfind("LIFTED;", 0) == 0 || packet.rfind("LIFT;", 0) == 0) {
+            std::string arg = packet.substr(packet.find(';') + 1);
+            if (arg == "ALL" || arg == "all") {
+                for (int r = 0; r < Config::MAX_ROBOTS; ++r) {
+                    signalPalletLifted(r);
+                }
+            } else {
+                try {
+                    int rid = std::stoi(arg);
+                    if (rid >= 0 && rid < Config::MAX_ROBOTS) {
+                        signalPalletLifted(rid);
+                    }
+                } catch (...) {}
+            }
+            return;
+        }
+
         // Mark all entities inactive before this frame
         for (auto& e : entities) e.active = false;
 
-        // Packet format: "ID,X,Y,Theta;ID,X,Y,Theta;..."
+        // Packet format: "PPM:<val>;ID,X,Y,Theta;ID,X,Y,Theta;..."
         std::istringstream stream(packet);
         std::string token;
 
         while (std::getline(stream, token, ';')) {
             if (token.empty()) continue;
+
+            // Dynamic scale calibration from real-time 2cm marker detection
+            if (token.rfind("PPM:", 0) == 0) {
+                try {
+                    float newPpm = std::stof(token.substr(4));
+                    if (newPpm > 100.0f && newPpm < 15000.0f) {
+                        calibrator.ppm = newPpm;
+                    }
+                } catch (...) {}
+                continue;
+            }
 
             int rawId, px, py, thetaDeg;
             char c1, c2, c3;
@@ -595,6 +644,8 @@ public:
             entities[rawId].type     = type;
             entities[rawId].pose     = calibrator.pixelToMetric((float)px, (float)py,
                                                                 (float)thetaDeg);
+            entities[rawId].rawPx    = px;
+            entities[rawId].rawPy    = py;
             entities[rawId].active   = true;
             entities[rawId].lastSeen = now;
         }
@@ -607,12 +658,15 @@ public:
     //    - guarantees start and goal regions are traversable
     // ------------------------------------------------------------------
     void buildGridForRobot(int robotId, int targetPalletId,
-                           const GridCell& startCell, const GridCell& goalCell)
+                           const GridCell& startCell, const GridCell& goalCell,
+                           int inflationR = -1)
     {
         grid.clear();
         grid.addBoundaryWalls();
 
-        int inflationR = OccupancyGrid::robotInflationCells();
+        if (inflationR < 0) {
+            inflationR = OccupancyGrid::robotInflationCells();
+        }
 
         for (int i = 0; i < 9; ++i) {
             if (!entities[i].active && (entities[i].lastSeen == 0.0)) continue;  // never seen
@@ -628,21 +682,42 @@ public:
                 // Pallets that aren't this robot's target are obstacles
                 isObstacle = true;
             }
-            // Destinations are traversable — the robot needs to drive onto them
+            // Destinations are traversable - the robot needs to drive onto them
 
             if (isObstacle) {
                 GridCell gc = calibrator.metricToGrid(entities[i].pose.x, entities[i].pose.y);
-                grid.blockCircle(gc.row, gc.col, inflationR);
+                if (inflationR > 0) {
+                    grid.blockCircle(gc.row, gc.col, inflationR);
+                } else {
+                    grid.block(gc.row, gc.col);
+                }
             }
         }
 
-        // NOTE: Obstacles are already inflated with blockCircle(..., inflationR).
-        // Do NOT call grid.inflate() here, which would double-inflate obstacles.
+        // Clear clearance around the robot's current position and target goal
+        int clearR = std::max(1, inflationR);
+        grid.unblockCircle(startCell.row, startCell.col, clearR);
+        grid.unblockCircle(goalCell.row, goalCell.col, clearR);
+    }
 
-        // Clear a 1-cell clearance around the robot's current position and target goal
-        // so the robot can always navigate, even when markers are clustered closely on a test image.
-        grid.unblockCircle(startCell.row, startCell.col, 1);
-        grid.unblockCircle(goalCell.row, goalCell.col, 1);
+    /// Robust multi-stage A* planner: tries full inflation, then 1-cell, then 0-cell fallback.
+    std::vector<GridCell> planPathForRobot(int robotId, int targetId,
+                                          const GridCell& start, const GridCell& goal)
+    {
+        // Attempt 1: Full safety inflation margin
+        buildGridForRobot(robotId, targetId, start, goal);
+        auto raw = AStarPathfinder::findPath(grid, start, goal);
+        if (!raw.empty()) return AStarPathfinder::simplifyPath(raw);
+
+        // Attempt 2: Minimal 1-cell safety margin (for tight spacing on desk/arena)
+        buildGridForRobot(robotId, targetId, start, goal, 1);
+        raw = AStarPathfinder::findPath(grid, start, goal);
+        if (!raw.empty()) return AStarPathfinder::simplifyPath(raw);
+
+        // Attempt 3: Point-robot fallback (guarantees a path if an open corridor exists)
+        buildGridForRobot(robotId, targetId, start, goal, 0);
+        raw = AStarPathfinder::findPath(grid, start, goal);
+        return AStarPathfinder::simplifyPath(raw);
     }
 
     // ------------------------------------------------------------------
@@ -731,9 +806,7 @@ public:
                     GridCell start = calibrator.metricToGrid(rpose.x, rpose.y);
                     GridCell goal  = calibrator.metricToGrid(entities[palletId].pose.x,
                                                             entities[palletId].pose.y);
-                    buildGridForRobot(robotId, palletId, start, goal);
-                    auto raw = AStarPathfinder::findPath(grid, start, goal);
-                    robots[r].path  = AStarPathfinder::simplifyPath(raw);
+                    robots[r].path  = planPathForRobot(robotId, palletId, start, goal);
                     robots[r].wpIdx = 0;
 
                     if (robots[r].path.empty()) {
@@ -772,11 +845,7 @@ public:
             case RobotState::PICKING_UP:
                 robots[r].cmdVel   = {0.0f, 0.0f};
                 robots[r].actuator = 1;
-                if ((now - robots[r].stateTimer) >= Config::ACTUATOR_DWELL_S) {
-                    robots[r].state = RobotState::CARRYING_TO_DEST;
-                    robots[r].path.clear();
-                    std::cout << "[STATE] Robot " << (r + 1) << " -> CARRYING_TO_DEST" << std::endl;
-                }
+                // Hold at pallet — wait for explicit LIFTED signal from hardware or visualizer ('L' key)
                 break;
 
             // ........................................................
@@ -793,9 +862,7 @@ public:
                     GridCell start = calibrator.metricToGrid(rpose.x, rpose.y);
                     GridCell goal  = calibrator.metricToGrid(entities[destId].pose.x,
                                                             entities[destId].pose.y);
-                    buildGridForRobot(robotId, -1, start, goal);   // no special target pallet to ignore
-                    auto raw = AStarPathfinder::findPath(grid, start, goal);
-                    robots[r].path  = AStarPathfinder::simplifyPath(raw);
+                    robots[r].path  = planPathForRobot(robotId, -1, start, goal);
                     robots[r].wpIdx = 0;
 
                     if (robots[r].path.empty()) {
@@ -954,19 +1021,15 @@ public:
         return true;
     }
 
-    /// Non-blocking receive.  Returns the latest complete packet or "".
-    std::string receiveVision() {
-        char buf[1024];
-        std::string latest;
-
-        // Drain the buffer — keep only the most recent packet
+    /// Non-blocking receive: retrieves all waiting UDP packets from the vision socket.
+    void receiveAllVision(std::vector<std::string>& packets) {
+        char buf[2048];
         while (true) {
             int n = recvfrom(rxSock, buf, sizeof(buf) - 1, 0, nullptr, nullptr);
             if (n <= 0) break;     // WSAEWOULDBLOCK or error — buffer empty
             buf[n] = '\0';
-            latest = buf;
+            packets.emplace_back(buf);
         }
-        return latest;
     }
 
     /// Send a velocity + actuator command for one robot.
@@ -980,11 +1043,11 @@ public:
     }
 
     /// Broadcast AR trajectory waypoints (in pixel coordinates) to the visualizer.
-    void sendVisualizerPath(int robotId, const std::string& stateStr,
+    void sendVisualizerPath(int robotId, const std::string& stateStr, int targetId,
                             const std::vector<std::pair<int, int>>& pixelPoints)
     {
         std::ostringstream oss;
-        oss << "PATH;" << robotId << ";" << stateStr;
+        oss << "PATH;" << robotId << ";" << stateStr << ";" << targetId;
         for (const auto& pt : pixelPoints) {
             oss << ";" << pt.first << "," << pt.second;
         }
@@ -1025,6 +1088,14 @@ int main() {
               << Config::GRID_ROWS << " cells  ("
               << Config::CELL_SIZE_M * 100 << " cm / cell)" << std::endl;
     std::cout << "  Calibration: " << Config::PIXELS_PER_METER << " px/m" << std::endl;
+    std::cout << "  Chassis    : " << Config::ROBOT_LENGTH_M * 100 << " x "
+              << Config::ROBOT_WIDTH_M * 100 << " cm (Track: "
+              << Config::TRACK_WIDTH_M * 100 << " cm, Wheel R: "
+              << Config::WHEEL_RADIUS_M * 100 << " cm)" << std::endl;
+    std::cout << "  Pixel cover: "
+              << (int)(Config::ARENA_WIDTH_M * Config::PIXELS_PER_METER) << " x "
+              << (int)(Config::ARENA_HEIGHT_M * Config::PIXELS_PER_METER)
+              << " px max" << std::endl;
     std::cout << "  Loop rate  : " << Config::LOOP_RATE_HZ << " Hz" << std::endl;
     std::cout << std::endl;
 
@@ -1053,8 +1124,9 @@ int main() {
         double now = timeNow();
 
         // -------- SENSE --------
-        std::string packet = net.receiveVision();
-        if (!packet.empty()) {
+        std::vector<std::string> packets;
+        net.receiveAllVision(packets);
+        for (const auto& packet : packets) {
             if (firstPacket) {
                 std::cout << "[SENSE] First vision packet received!" << std::endl;
                 firstPacket = false;
@@ -1070,30 +1142,65 @@ int main() {
             const auto& ctrl = mgr.robots[r];
             net.sendCommand(r, ctrl.cmdVel.vLeft, ctrl.cmdVel.vRight, ctrl.actuator);
 
-            // Broadcast AR trajectory waypoints for the visualizer
-            if (ctrl.path.empty() || !mgr.entities[r].active) {
-                net.clearVisualizerPath(r);
-            } else {
-                std::vector<std::pair<int, int>> pxPoints;
-                // Point 0: Robot's current pixel position on the live camera frame
-                int rpx, rpy;
-                mgr.calibrator.metricToPixel(mgr.entities[r].pose.x, mgr.entities[r].pose.y, rpx, rpy);
-                pxPoints.push_back({rpx, rpy});
+            // ---- AR Trajectory Overlay for Visualizer ----
+            // Approach pallet or at pallet: only show path to pallet.
+            // Only when LIFTED is confirmed: show path to destination!
+            bool showPath = false;
+            int targetId = -1;
 
-                // Points 1..N: Path waypoints (from current active waypoint to goal)
-                for (size_t i = ctrl.wpIdx; i < ctrl.path.size(); ++i) {
+            if (ctrl.state == RobotState::DRIVING_TO_PALLET) {
+                showPath = !ctrl.path.empty();
+                targetId = ctrl.targetPallet;
+            } else if (ctrl.state == RobotState::PICKING_UP) {
+                showPath = true;
+                targetId = ctrl.targetPallet;
+            } else if (ctrl.state == RobotState::CARRYING_TO_DEST) {
+                showPath = !ctrl.path.empty();
+                targetId = ctrl.targetDest;
+            }
+
+            if (!showPath || !mgr.entities[r].active) {
+                net.clearVisualizerPath(r);
+                continue;
+            }
+
+            std::vector<std::pair<int, int>> pxPoints;
+
+            // Point 0: Robot's EXACT pixel position from camera (no grid quantization)
+            pxPoints.push_back({mgr.entities[r].rawPx, mgr.entities[r].rawPy});
+
+            // Points 1..N-1: Intermediate A* turning waypoints (grid -> metric -> pixel)
+            if (ctrl.state == RobotState::DRIVING_TO_PALLET || ctrl.state == RobotState::CARRYING_TO_DEST) {
+                for (size_t i = std::max((int)ctrl.wpIdx, 1);
+                     i + 1 < ctrl.path.size(); ++i)
+                {
                     Pose wp = mgr.calibrator.gridToMetric(ctrl.path[i]);
                     int wpx, wpy;
                     mgr.calibrator.metricToPixel(wp.x, wp.y, wpx, wpy);
                     pxPoints.push_back({wpx, wpy});
                 }
-                net.sendVisualizerPath(r, robotStateName(ctrl.state), pxPoints);
             }
+
+            // Final point: Target's EXACT pixel position from camera
+            if (targetId >= 0 && targetId <= 8 && mgr.entities[targetId].active) {
+                pxPoints.push_back({mgr.entities[targetId].rawPx,
+                                    mgr.entities[targetId].rawPy});
+            } else if (!ctrl.path.empty()) {
+                // Fallback: use grid-converted last waypoint
+                Pose lastWp = mgr.calibrator.gridToMetric(ctrl.path.back());
+                int lpx, lpy;
+                mgr.calibrator.metricToPixel(lastWp.x, lastWp.y, lpx, lpy);
+                pxPoints.push_back({lpx, lpy});
+            }
+
+            net.sendVisualizerPath(r, robotStateName(ctrl.state), targetId, pxPoints);
         }
 
         // -------- STATUS PRINT (every ~2 seconds) --------
         if (cycleCount % (Config::LOOP_RATE_HZ * 2) == 0 && !firstPacket) {
-            std::cout << "-------- cycle " << cycleCount << " --------" << std::endl;
+            std::cout << "-------- cycle " << cycleCount
+                      << " (Scale: " << std::fixed << std::setprecision(1) << mgr.calibrator.ppm << " px/m) --------"
+                      << std::endl;
             for (int r = 0; r < Config::MAX_ROBOTS; ++r) {
                 int rid = r;
                 const auto& e = mgr.entities[rid];
